@@ -1,0 +1,94 @@
+index=securewatch_portal cat=portal type=attack-info 
+| where (duration%3600=0 OR status!="ongoing") 
+| fillnull matpr matbr value=0 
+| eval duration=round(duration/60,0) 
+| eval duration=duration.if(duration=1," minute"," minutes") 
+| lookup cidr_service_level_policy cidr as dip OUTPUT description as sldescription level 
+| rex field=sldescription "(?<tenant>(\w|\s)+):\s(?<cidr>.+)\s\((?<name>.+)\)" 
+| fillnull value="Undefined" name tenant 
+| eval message=case(status="start","New attack",status="end","Ended attack",true(),"Ongoing attack for ".duration) 
+| eval message=message." to IP Address ".dip." [ ".tenant." / ".name." ] Max pps: ".matpr.",Max Mbp:".matbr." , Info: ".description.", id: ".id 
+| eval attack_status=status
+| eval cat="alert",type="attack" 
+| rename atpr AS current_pps atbr as current_mbps matpr as max_pps matbr as max_mbps id as attack_id
+| join type=left dip 
+    [ search index=securewatch_summary summary_type=junos type=autonomic 
+    | bucket span=1m _time 
+    | eval target=lower(target) 
+    | rex field=data "(?<rulename>cns[-][2{0}]\d\d\d\d\d)" 
+    | lookup rule_classification Rule as rulename OUTPUT Description 
+    | table _time target data 
+    | rex field=data "(?<rulename>cns[-][2{0}]\d\d\d\d\d)" 
+    | rex field=data "protocol=(?<protocol>\w+);" 
+    | rex field=data "(?<porttype>\w)prt=(?<rexport>\d+);" 
+    | eval sprt=if(porttype="s", rexport, null()) 
+    | eval dprt=if(porttype="d", rexport, null()) 
+    | lookup rule_classification Rule as rulename OUTPUT Description 
+    | rename target AS dip 
+    | eval port=rexport. " [".protocol."]" 
+    | eval rule=rulename ." [".Description."]" 
+    | fields - porttype rexport 
+    | stats values(data) as v_data values(dprt) as v_dprt values(sprt) as v_sprt values(port) as ports values(rulename) as v_rulename values(rule) as v_rules by _time dip] 
+| append 
+    [| search index=securewatch type=rule-trigger 
+    | multikv 
+    | addinfo 
+    | eval new=if(rtst>info_min_time,1,0) 
+    | search new=1 
+    | stats latest(_time) as _time values(rtr) as rules by rtip 
+    | nomv(rules) 
+    | eval message="Detection rule [".rules."]. to IP ".rtip 
+    | eval attack_id="Netflow detection event" 
+    | eval attack_status="start" 
+    | rename rtip as dip 
+    | table _time, attack_id, attack_status, message dip 
+    | eval cat="alert",type="netflow"] 
+| append 
+    [| search (splunk_server=local index=securewatch type=alarm TERM(mm=0) ) 
+    | eval mytxt=if(isnotnull(txt),txt,sp) 
+    | eval message=((((((((("Type: " . atype) . ". Device ") + aname) + " [") . mot) . " ") . mon) . "]. message: ") + mytxt) 
+    | stats first(_time) as _time first(clrd) as clrd by message sev 
+    | eval attack_id=("CMS Alarm - " . sev) 
+    | eval attack_status=if((clrd == "true"),"Cleared","Active") 
+    | eval cat="alert",type="status"] 
+| append 
+    [| search (splunk_server=local index=securewatch type=blackhole-notify TERM(v=1) ) 
+    | eval message=(((upper(substr(action,1,1)) . substr(action,2)) . " ") . addr) 
+    | eval attack_id="RTBH Event" 
+    | eval attack_status=if(isnotnull(state),state,action) 
+    | table _time, attack_id, attack_status, message 
+    | eval cat="alert",type="blackhole"] 
+| append 
+    [| search (splunk_server=local index=securewatch type=flowspec-notify TERM(v=1) ) 
+    | eval message=(((((upper(substr(action,1,1)) . substr(action,2)) . " - Match:") . match) . " Action:") . act) 
+    | eval attack_id="FlowSpec Event" 
+    | eval attack_status=if(isnotnull(state),state,action) 
+    | table _time, attack_id, attack_status, message 
+    | eval cat="alert",type="flowspec"] 
+| append 
+    [| search (splunk_server=local index=securewatch type=system-status-issues TERM(v=2) ) 
+    | multikv forceheader=2 
+    | where (true() XOR match('_raw',"maintenance")) 
+    | eventstats max(_time) as max_time 
+    | where ('_time' == max_time) 
+    | eval message=((((("Device:" . ssid) . if((ssis == "n/a"),"",("/" . ssis))) . ": ") . ssim) . ".") 
+    | stats values(message) as message by ssit ssil _time 
+    | eval Status=if((ssit == "devices"),"device",ssit) 
+    | eval attack_id=("System Status - " . ssit) 
+    | eval attack_status=ssil 
+    | table _time, attack_id, attack_status, message 
+    | eval cat="alert",type="alarms"] 
+| join type=left 
+    [| rest /services/server/info 
+    | table serverName ] 
+| sort 0 - _time 
+| eval extra=if(isnotnull(dip),"Target: ".dip,"") 
+| eval title="Corero Alert!: ".type." ".cat." (".attack_status.") ".extra 
+| eval icon=case(attack_status IN ("start","Active","active","error"),":rotating_light:",attack_status IN ("Cleared","withdrawn"),":warning:",true(),":grey_exclamation:") 
+| where ( isnull(attack_duration) OR (attack_status!="ongoing" OR attack_duration%3600=0) ) 
+| eval url_app=case(type="attack","attack_info",type IN("flowspec","black_hole"),"rtbh",true(),"home") 
+| eval url_base="https://vswa.tds.lab:8000/en-US/app/securewatch_analytics/" 
+| eval url_options="?form.time.earliest=".attack_start."&form.time.latest=now&form.my_search=dip%3D".dip."%20attack_id%3D".attack_id 
+| eval url=url_base.url_app.if(isnotnull(url_options),url_options,"") 
+| table _time cat type dip attack_id attack_status title message
+| rename attack_id as "JunOS Term Name ID" attack_status as Status message as Information cat as Category type as "Alert Type" dip as "Target IP" title as Title
